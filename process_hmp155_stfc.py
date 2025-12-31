@@ -8,15 +8,9 @@ import ncas_amof_netcdf_template as nant
 import datetime as dt
 from datetime import datetime
 import cftime
-from datetime import timezone
-
-
 import re
 import os
 from datetime import datetime, timezone
-from read_format5_content import read_format5_content
-from read_format5_header import read_format5_header
-from read_format5_chdb import read_format5_chdb
 
 DATE_REGEX = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}" 
 d = re.compile(DATE_REGEX)
@@ -37,72 +31,89 @@ def proc_line(line, extra_info=None):
     else:
         return []
 
-def preprocess_data_f5(infile):
-    """
-    Preprocesses the data file to extract a Polars DataFrame with TIMESTAMP, Air_T_Avg, and RH_Avg columns.
-    Applies preprocessing to oatnew_ch and rhnew_ch using rawrange and realrange from chdb.
-    """
-    print(f"Processing file: {infile}")
+def preprocess_data(infile):
+    print(infile)
 
-    # Step 1: Use read_format5_header to extract the header
-    header = read_format5_header(infile)
+    # Step 1: Read the current day's file
+    with open(infile, "r") as f:
+        data = f.readlines()
 
-    # Step 2: Use read_format5_content to read and process the file
-    df = read_format5_content(infile, header)
+    # Step 2: Parse the header to get column names
+    header_line = data[1].strip()  # Assume the second line contains column names
+    column_names = [col.strip('"') for col in header_line.split(",")]  # Clean column names
+    print(f"Parsed column names: {column_names}")  # Debugging output
 
-    print(df)
+    # Step 3: Skip metadata lines (assume first 4 lines are metadata)
+    data_lines = data[4:]  # Data starts after the first 4 lines
 
-    # Load the channel database
-    chdb_file = os.path.join("./", "f5channelDB.chdb")
-    chdb = read_format5_chdb(chdb_file)
+    # Step 4: Process the current day's data
+    processed_data = []
+    for line in data_lines:
+        if line.strip():  # Skip empty lines
+            fields = line.strip().split(",")
+            processed_data.append(fields)
 
-    print(chdb['oatnew_ch'])
-    print(chdb['rhnew_ch'])
+    # Step 5: Create a Polars DataFrame with the parsed column names
+    df = pl.DataFrame(processed_data, schema=column_names, orient="row")
 
+    # Step 6: Ensure required columns exist
+    required_columns = ["TIMESTAMP", "Air_T_Avg", "RH_Avg"]
+    for column in required_columns:
+        if column not in df.columns:
+            print(f"Column '{column}' is missing. Filling with null values.")
+            df = df.with_columns(pl.lit(None).alias(column))
 
-    # Extract rawrange and realrange for oatnew_ch and rhnew_ch
-    oatnew_rawrange = chdb["oatnew_ch"]["rawrange"]
-    oatnew_realrange = chdb["oatnew_ch"]["realrange"]
-    rhnew_rawrange = chdb["rhnew_ch"]["rawrange"]
-    rhnew_realrange = chdb["rhnew_ch"]["realrange"]
+    # Step 7: Strip quotes from all string columns
+    for column in df.columns:
+        if df.schema[column] == pl.Utf8:
+            df = df.with_columns(
+                pl.col(column).str.strip_chars('"').alias(column)
+            )
 
-    # Define a function to map raw values to real values
-    def map_to_real_range(raw_col, raw_range, real_range):
-        raw_min, raw_max = raw_range["lower"], raw_range["upper"]
-        real_min, real_max = real_range["lower"], real_range["upper"]
-        return (pl.col(raw_col) - raw_min) / (raw_max - raw_min) * (real_max - real_min) + real_min
+    # Step 8: Replace invalid values (e.g., "NAN") with null
+    for column in ["Air_T_Avg", "RH_Avg"]:  # Only process relevant columns
+        if column in df.columns:
+            df = df.with_columns(
+                pl.when(pl.col(column) == "NAN")
+                .then(None)
+                .otherwise(pl.col(column))
+                .alias(column)
+            )
 
-    # Ensure the columns are numeric
-    df = df.with_columns([
-        pl.col("oatnew_ch").cast(pl.Float64),
-        pl.col("rhnew_ch").cast(pl.Float64)
-    ])
+    # Step 9: Convert specific columns to appropriate data types
+    type_conversions = {
+        "TIMESTAMP": pl.Datetime,
+        "Air_T_Avg": pl.Float64,
+        "RH_Avg": pl.Float64,
+    }
 
-    # Apply the mapping to oatnew_ch and rhnew_ch
-    df = df.with_columns([
-        map_to_real_range("oatnew_ch", oatnew_rawrange, oatnew_realrange).alias("Air_T_Avg"),
-        map_to_real_range("rhnew_ch", rhnew_rawrange, rhnew_realrange).alias("RH_Avg")
-    ])
+    for column, dtype in type_conversions.items():
+        if column in df.columns:
+            if column == "TIMESTAMP":
+                # Parse TIMESTAMP column to proper datetime format
+                df = df.with_columns(
+                    pl.col("TIMESTAMP").str.strptime(
+                        pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False
+                    )
+                )
+            else:
+                df = df.with_columns(pl.col(column).cast(dtype))
 
-    # Keep only TIMESTAMP, WS_Avg, and WD_Avg columns
+    # Step 10: Keep only the TIMESTAMP, WS_Avg, and WD_Avg columns
     df = df.select(["TIMESTAMP", "Air_T_Avg", "RH_Avg"])
 
     df = df.with_columns([
-        (pl.col("Air_T_Avg") + 273.15).alias("Air_T_Avg")
+        (pl.col("Air_T_Avg") * 0.02 + 233.15).alias("Air_T_Avg"),
+        (pl.col("RH_Avg")*0.02 + 0.00).alias("RH_Avg"),
     ])
 
-    # Round WS_Avg and WD_Avg to 3 decimal places
-    #df = df.with_columns(
-    #    pl.col("WS_Avg").round(3).alias("WS_Avg"),
-    #    pl.col("WD_Avg").round(3).alias("WD_Avg")
-    #)
 
     return df
 
 
-def main(infile, outdir="./", metadata_file="metadata.json", aws_7_file=None):
+def main(infile, outdir="./", metadata_file="metadata_stfc.json", aws_7_file=None):
     # Read data
-    df = preprocess_data_f5(infile)
+    df = preprocess_data(infile)
 
     print(df)
 
@@ -138,10 +149,14 @@ def main(infile, outdir="./", metadata_file="metadata.json", aws_7_file=None):
     file_date = f"{str(years[0])}{str(months[0]).zfill(2)}{str(days[0]).zfill(2)}"
 
     # Create NetCDF file
-    nc = nant.create_netcdf.main("ncas-temperature-rh-1", date=file_date, 
+    #nc = nant.create_netcdf.main("ncas-temperature-rh-1", date=file_date, 
+    #                             dimension_lengths={"time": len(unix_times)}, 
+    #                             products="surface-met", file_location=outdir, 
+    #                             product_version="1.0")
+    
+    nc = nant.create_netcdf.make_product_netcdf("surface-met","stfc-temperature-rh-1", date=file_date, 
                                  dimension_lengths={"time": len(unix_times)}, 
-                                 products="surface-met", file_location=outdir, 
-                                 product_version="1.0")
+                                 file_location=outdir, platform="cao")
     if isinstance(nc, list):
         print("[WARNING] Unexpectedly got multiple netCDFs returned from nant.create_netcdf.main, just using first file...")
         nc = nc[0]
@@ -181,6 +196,8 @@ def main(infile, outdir="./", metadata_file="metadata.json", aws_7_file=None):
     # Add wind data from sonic to NetCDF file
     nant.util.update_variable(nc, "air_temperature", df["Air_T_Avg"])
     nant.util.update_variable(nc, "relative_humidity", df["RH_Avg"])
+
+
 
     # Add time_coverage_start and time_coverage_end metadata using data from get_times
     nc.setncattr(
@@ -229,7 +246,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Vaisala HMP155 Temperature and Humidity Probe data to netCDF")
     parser.add_argument("infile", type=str, help="Input file")
     parser.add_argument("-o", "--outdir", type=str, default="./", help="Output directory")
-    parser.add_argument("-m", "--metadata_file", type=str, default="metadata.json", help="Metadata file")
+    parser.add_argument("-m", "--metadata_file", type=str, default="metadata_stfc.json", help="Metadata file")
 
     args = parser.parse_args()
     main(args.infile, outdir=args.outdir, metadata_file=args.metadata_file)

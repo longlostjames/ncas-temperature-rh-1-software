@@ -5,14 +5,19 @@ import numpy as np
 import argparse
 from netCDF4 import Dataset
 import pandas as pd
+from datetime import datetime
 
 # Parse command-line argument
 parser = argparse.ArgumentParser(description='Detect purge cycles in Vaisala HMP155 data and update QC flags in the NetCDF file.')
 parser.add_argument('-f', '--file', required=True, help='Path to CF-compliant NetCDF file')
 parser.add_argument('-p', '--previous_file', required=False, help='Path to the previous day\'s NetCDF file for purge time consistency check')
+parser.add_argument('--corr_file_temperature', type=str, default=None, help='Correction file with BADDATA intervals for air temperature')
+parser.add_argument('--corr_file_rh', type=str, default=None, help='Correction file with BADDATA intervals for relative humidity')
 args = parser.parse_args()
 filename = args.file
 previous_filename = args.previous_file
+corr_file_temperature = args.corr_file_temperature
+corr_file_rh = args.corr_file_rh
 
 # Parameters
 window_minutes = 8
@@ -139,6 +144,29 @@ def set_time_units_to_seconds_since_epoch(nc_file):
             time_var = ds.variables['time']
             time_var.setncattr('units', 'seconds since 1970-01-01 00:00:00')
             print(f"Updated time units to 'seconds since 1970-01-01 00:00:00' in {nc_file}")
+
+def read_bad_intervals(corr_file):
+    bad_intervals = []
+    with open(corr_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 4 and parts[-1] == "BADDATA":
+                date = parts[0]
+                start = parts[1]
+                end = parts[2]
+                start_dt = datetime.strptime(date + start, "%Y%m%d%H%M%S")
+                end_dt = datetime.strptime(date + end, "%Y%m%d%H%M%S")
+                bad_intervals.append((start_dt, end_dt))
+    return bad_intervals
+
+def flag_bad_data_xr(ds, bad_intervals, flag_var):
+    # Convert NetCDF time to pandas datetime
+    time = pd.to_datetime(ds['time'].values)
+    qc = ds[flag_var].values.copy()
+    for start, end in bad_intervals:
+        mask = (time >= start) & (time <= end)
+        qc[mask] = 2
+    ds[flag_var].values[:] = qc
 
 # Open the dataset in read/write mode
 with xr.open_dataset(filename, mode='r+') as ds:
@@ -310,6 +338,17 @@ with xr.open_dataset(filename, mode='r+') as ds:
         'flag_values': np.array([0, 1, 2, 3, 4], dtype=np.int8),
         'flag_meanings': 'not_used good_data bad_data_measurement_suspect bad_data_purge_cycle_value_fixed_as_start_of_purge recovery_in_rh_after_purge'
     }
+
+    # --- Flag bad data intervals from correction files ---
+    if corr_file_temperature:
+        bad_intervals_temp = read_bad_intervals(corr_file_temperature)
+        print(f"Flagging bad data intervals for air temperature from {corr_file_temperature}")
+        flag_bad_data_xr(ds, bad_intervals_temp, "qc_flag_air_temperature")
+
+    if corr_file_rh:
+        bad_intervals_rh = read_bad_intervals(corr_file_rh)
+        print(f"Flagging bad data intervals for relative humidity from {corr_file_rh}")
+        flag_bad_data_xr(ds, bad_intervals_rh, "qc_flag_relative_humidity")
 
     # Save changes to the file
     ds.to_netcdf(filename, mode='a')  # Append mode ensures updates are written

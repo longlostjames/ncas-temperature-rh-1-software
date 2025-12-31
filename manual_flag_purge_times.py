@@ -75,6 +75,17 @@ def flag_based_on_time_of_day(ds, purge_intervals, recovery_duration=6 * 60):
         recovery_mask = (time_of_day >= recovery_start_seconds) & (time_of_day < recovery_end_seconds)
         ds["qc_flag_relative_humidity"].values[recovery_mask] = FLAG_RH_RECOVERY
 
+def clear_purge_flags(ds):
+    """Set all purge and recovery flags back to FLAG_GOOD."""
+    if "qc_flag_air_temperature" in ds.variables:
+        arr = ds["qc_flag_air_temperature"].values
+        arr[(arr == FLAG_PURGE)] = FLAG_GOOD
+        ds["qc_flag_air_temperature"].values[:] = arr
+    if "qc_flag_relative_humidity" in ds.variables:
+        arr = ds["qc_flag_relative_humidity"].values
+        arr[(arr == FLAG_PURGE) | (arr == FLAG_RH_RECOVERY)] = FLAG_GOOD
+        ds["qc_flag_relative_humidity"].values[:] = arr
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Manually flag purge periods in a NetCDF file based on time of day.")
@@ -83,6 +94,7 @@ def main():
     parser.add_argument("--shift-seconds", type=float, default=0.0, help="Shift purge times by this many seconds (default: 0.0)")
     parser.add_argument("-s", "--start", help="Start time of the purge period (format: HH:MM:SS)")
     parser.add_argument("-e", "--end", help="End time of the purge period (format: HH:MM:SS)")
+    parser.add_argument("--clear-purge-flags", action="store_true", help="Clear existing purge and recovery flags before applying new ones")
     args = parser.parse_args()
 
     # Determine purge intervals
@@ -128,6 +140,10 @@ def main():
                 "flag_values": np.array([0, 1, 2, 3, 4], dtype=np.int8),
                 "flag_meanings": "not_used good_data bad_data_measurement_suspect bad_data_purge_cycle_value_fixed_as_start_of_purge recovery_in_rh_after_purge"
             }
+
+        # Clear existing purge/recovery flags if requested
+        if args.clear_purge_flags:
+            clear_purge_flags(ds)
 
         # Flag data based on time of day
         flag_based_on_time_of_day(ds, purge_intervals)

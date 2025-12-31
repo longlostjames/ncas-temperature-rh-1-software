@@ -4,13 +4,14 @@
 
 import polars as pl
 import numpy as np
+from datetime import datetime
 import ncas_amof_netcdf_template as nant
 import datetime as dt
-from datetime import datetime
-import cftime
 import re
 import os
-from datetime import datetime, timezone
+import argparse
+import cftime
+from datetime import timezone
 
 DATE_REGEX = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{6}" 
 d = re.compile(DATE_REGEX)
@@ -32,89 +33,41 @@ def proc_line(line, extra_info=None):
         return []
 
 def preprocess_data(infile):
-    print(infile)
+    # Only read relevant columns, skip first 4 lines
+    try:
+        df = pl.read_csv(
+            infile,
+            skip_rows=4,
+            columns=["TIMESTAMP", "Air_T_Avg", "RH_Avg"],
+            try_parse_dates=True,
+            ignore_errors=True
+        )
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return pl.DataFrame({"TIMESTAMP": [], "Air_T_Avg": [], "RH_Avg": []})
 
-    # Step 1: Read the current day's file
-    with open(infile, "r") as f:
-        data = f.readlines()
-
-    # Step 2: Parse the header to get column names
-    header_line = data[1].strip()  # Assume the second line contains column names
-    column_names = [col.strip('"') for col in header_line.split(",")]  # Clean column names
-    print(f"Parsed column names: {column_names}")  # Debugging output
-
-    # Step 3: Skip metadata lines (assume first 4 lines are metadata)
-    data_lines = data[4:]  # Data starts after the first 4 lines
-
-    # Step 4: Process the current day's data
-    processed_data = []
-    for line in data_lines:
-        if line.strip():  # Skip empty lines
-            fields = line.strip().split(",")
-            processed_data.append(fields)
-
-    # Step 5: Create a Polars DataFrame with the parsed column names
-    df = pl.DataFrame(processed_data, schema=column_names, orient="row")
-
-    # Step 6: Ensure required columns exist
-    required_columns = ["TIMESTAMP", "Air_T_Avg", "RH_Avg"]
-    for column in required_columns:
-        if column not in df.columns:
-            print(f"Column '{column}' is missing. Filling with null values.")
-            df = df.with_columns(pl.lit(None).alias(column))
-
-    # Step 7: Strip quotes from all string columns
-    for column in df.columns:
-        if df.schema[column] == pl.Utf8:
-            df = df.with_columns(
-                pl.col(column).str.strip_chars('"').alias(column)
-            )
-
-    # Step 8: Replace invalid values (e.g., "NAN") with null
-    for column in ["Air_T_Avg", "RH_Avg"]:  # Only process relevant columns
-        if column in df.columns:
-            df = df.with_columns(
-                pl.when(pl.col(column) == "NAN")
-                .then(None)
-                .otherwise(pl.col(column))
-                .alias(column)
-            )
-
-    # Step 9: Convert specific columns to appropriate data types
-    type_conversions = {
-        "TIMESTAMP": pl.Datetime,
-        "Air_T_Avg": pl.Float64,
-        "RH_Avg": pl.Float64,
-    }
-
-    for column, dtype in type_conversions.items():
-        if column in df.columns:
-            if column == "TIMESTAMP":
-                # Parse TIMESTAMP column to proper datetime format
-                df = df.with_columns(
-                    pl.col("TIMESTAMP").str.strptime(
-                        pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False
-                    )
-                )
-            else:
-                df = df.with_columns(pl.col(column).cast(dtype))
-
-    # Step 10: Keep only the TIMESTAMP, WS_Avg, and WD_Avg columns
-    df = df.select(["TIMESTAMP", "Air_T_Avg", "RH_Avg"])
+    # Only keep relevant columns
+    keep = ["TIMESTAMP", "Air_T_Avg", "RH_Avg"]
+    for col in keep:
+        if col not in df.columns:
+            print(f"Column '{col}' missing, filling with null.")
+            df = df.with_columns(pl.lit(None).alias(col))
+    df = df.select(keep)
+    # Convert types
+    scale_factor_Air_T = 0.02
+    offset_Air_T = 233.15  # Offset for temperature in Kelvin
+    scale_factor_RH = 0.02  # Scale factor for relative humidity, typically 0.02
+    offset_RH = 0.0  # Offset for relative humidity, typically 0
 
     df = df.with_columns([
-        (pl.col("Air_T_Avg") * 0.02 + 233.15).alias("Air_T_Avg"),
-        (pl.col("RH_Avg")*0.02 + 0.00).alias("RH_Avg"),
+        pl.col("Air_T_Avg").cast(pl.Float64) * scale_factor_Air_T + offset_Air_T,
+        pl.col("RH_Avg").cast(pl.Float64) * scale_factor_RH + offset_RH
     ])
-
-
     return df
 
 
 def main(infile, outdir="./", metadata_file="metadata.json", aws_7_file=None):
-    # Read data
     df = preprocess_data(infile)
-
     print(df)
 
     # Check if the year of the last timestamp is one greater than the previous timestamp
@@ -237,13 +190,58 @@ def none_or_str(value):
     return value
 
 
+def read_bad_intervals(corr_file):
+    bad_intervals = []
+    with open(corr_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 4 and parts[-1] == "BADDATA":
+                date = parts[0]
+                start = parts[1]
+                end = parts[2]
+                # Build datetime objects for start and end
+                start_dt = datetime.strptime(date + start, "%Y%m%d%H%M%S")
+                end_dt = datetime.strptime(date + end, "%Y%m%d%H%M%S")
+                bad_intervals.append((start_dt, end_dt))
+    return bad_intervals
+
+def flag_bad_data(df, bad_intervals, flag_column):
+    timestamps = df["TIMESTAMP"].to_numpy()
+    mask = np.zeros(len(timestamps), dtype=bool)
+    for start, end in bad_intervals:
+        mask |= (timestamps >= start) & (timestamps <= end)
+    # Add the mask as a Boolean column
+    df = df.with_columns(pl.Series("bad_mask", mask))
+    # Now update the flag column in Polars
+    if flag_column in df.columns:
+        df = df.with_columns(
+            pl.when(pl.col("bad_mask")).then(2).otherwise(pl.col(flag_column)).alias(flag_column)
+        )
+    else:
+        df = df.with_columns(
+            pl.when(pl.col("bad_mask")).then(2).otherwise(0).alias(flag_column)
+        )
+    # Remove the temporary mask column
+    df = df.drop("bad_mask")
+    return df
+
+
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Process Vaisala HMP155 Temperature and Humidity Probe data to netCDF")
     parser.add_argument("infile", type=str, help="Input file")
     parser.add_argument("-o", "--outdir", type=str, default="./", help="Output directory")
     parser.add_argument("-m", "--metadata_file", type=str, default="metadata.json", help="Metadata file")
+    #parser.add_argument("--corr_file_rh", type=str, default=None, help="Correction file with BADDATA intervals for RH")
+    #parser.add_argument("--corr_file_temperature", type=str, default=None, help="Correction file with BADDATA intervals for air temperature")
 
     args = parser.parse_args()
-    main(args.infile, outdir=args.outdir, metadata_file=args.metadata_file)
+
+    main(
+        args.infile,
+        outdir=args.outdir,
+        metadata_file=args.metadata_file,
+        aws_7_file=args.aws_7_file if hasattr(args, "aws_7_file") else None #,
+        #corr_file_temperature=args.corr_file_temperature,
+        #corr_file_rh=args.corr_file_rh
+    )
 
